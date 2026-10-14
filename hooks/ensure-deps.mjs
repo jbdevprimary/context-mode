@@ -19,7 +19,7 @@
  * @see https://github.com/mksglu/context-mode/issues/203
  */
 
-import { existsSync, copyFileSync, renameSync, unlinkSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -49,6 +49,69 @@ const NATIVE_DEPS = ["better-sqlite3"];
 const NATIVE_BINARIES = {
   "better-sqlite3": ["build", "Release", "better_sqlite3.node"],
 };
+const BOOTSTRAP_LEASE = ".context-mode-native-bootstrap.lock";
+
+function nativeBinaryPaths(pluginRoot) {
+  const nativeDir = resolve(pluginRoot, "node_modules", "better-sqlite3", "build", "Release");
+  return {
+    binaryPath: resolve(nativeDir, "better_sqlite3.node"),
+    abiCachePath: resolve(nativeDir, `better_sqlite3.abi${process.versions.modules}.node`),
+  };
+}
+
+/**
+ * Claim the cache-local dependency bootstrap lease without waiting.
+ *
+ * Hooks run as independent processes, so a module-level Promise cannot stop a
+ * cold PostToolUse burst from launching multiple native builds. A losing hook
+ * must return immediately: hooks are best-effort and the next event will see
+ * the winner's completed dependency. We deliberately do not remove a lock we
+ * did not create, including an old one. Automatic stale-lock deletion can
+ * steal a slow install or a lock owned by a reused PID.
+ */
+function tryAcquireBootstrapLease(pluginRoot) {
+  const path = resolve(pluginRoot, BOOTSTRAP_LEASE);
+  const owner = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  let fd;
+
+  try {
+    fd = openSync(path, "wx", 0o600);
+    writeFileSync(fd, owner, "utf8");
+    return { path, fd, owner };
+  } catch {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+    return null;
+  }
+}
+
+function releaseBootstrapLease(lease) {
+  try { closeSync(lease.fd); } catch { /* best effort */ }
+
+  // Never remove a lock that has been replaced by another owner.
+  try {
+    if (readFileSync(lease.path, "utf8") === lease.owner) {
+      unlinkSync(lease.path);
+    }
+  } catch { /* best effort */ }
+}
+
+/**
+ * Run a native-dependency mutation once across all hook processes sharing a
+ * plugin cache. Returns false to a non-owner so callers can fail open.
+ */
+export async function withNativeBootstrapLease(pluginRoot, bootstrap) {
+  const lease = tryAcquireBootstrapLease(pluginRoot);
+  if (!lease) return false;
+
+  try {
+    await bootstrap();
+    return true;
+  } finally {
+    releaseBootstrapLease(lease);
+  }
+}
 
 /**
  * Check if the current runtime has built-in SQLite support.
@@ -62,6 +125,15 @@ function hasModernSqlite() {
   if (typeof globalThis.Bun !== "undefined") return true;
   const [major, minor] = process.versions.node.split(".").map(Number);
   return major > 22 || (major === 22 && minor >= 5);
+}
+
+function nativeBootstrapAlreadyReady(pluginRoot) {
+  // The modern-Node path already treats the ABI cache as a valid success
+  // marker. Preserve the older-runtime probe behavior by taking the lease
+  // there, rather than changing its compatibility semantics.
+  if (typeof globalThis.Bun !== "undefined" || !hasModernSqlite()) return false;
+  const { binaryPath, abiCachePath } = nativeBinaryPaths(pluginRoot);
+  return existsSync(binaryPath) && existsSync(abiCachePath);
 }
 
 export async function ensureDeps() {
@@ -247,8 +319,15 @@ export function codesignBinary(binaryPath) {
   }
 }
 
-// Auto-run on import (like suppress-stderr.mjs).
-// Top-level await ensures the heal completes before the importer's next
-// statement runs (which is typically `new Database(...)`).
-await ensureDeps();
-ensureNativeCompat(root);
+// Auto-run on import (like suppress-stderr.mjs). The lock covers both package
+// installation and ABI repair: those operations mutate the same paths and
+// must not race across independent hook processes.
+if (!nativeBootstrapAlreadyReady(root)) {
+  await withNativeBootstrapLease(root, async () => {
+    // Another hook may have completed the bootstrap while this one was waiting
+    // to start, so re-check only after becoming the owner.
+    if (nativeBootstrapAlreadyReady(root)) return;
+    await ensureDeps();
+    ensureNativeCompat(root);
+  });
+}

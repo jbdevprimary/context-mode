@@ -11,11 +11,11 @@
  */
 
 import { describe, test, expect, afterAll } from "vitest";
-import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // ── Test harness script ──
 // Replicates ensure-deps.mjs logic but captures commands instead of executing.
@@ -506,7 +506,6 @@ console.log(JSON.stringify({ ok: true }));
 // delegate. ABI-mismatch heal in ensureNativeCompat() is unrelated and
 // must remain (regression-critical — guards #148, #203).
 
-import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
 describe("ensure-deps: better-sqlite3 binding self-heal (#408)", () => {
@@ -576,5 +575,94 @@ describe("ensure-deps: better-sqlite3 binding self-heal (#408)", () => {
     expect(branch).toContain("copyFileSync(binaryPath, abiCachePath)");
     expect(branch).not.toMatch(/if\s*\(\s*!\s*existsSync\(binaryPath\)\s*\)/);
     expect(branch).not.toContain("binding present");
+  });
+});
+
+// ── Cross-process bootstrap lease ─────────────────────────────────────────
+
+function createLeaseTestModule(): string {
+  const fixtureDir = createTempRoot();
+  const source = readFileSync(ensureDepsAbsPath, "utf8");
+  // The production file intentionally self-starts. Strip only that final
+  // launcher so this fixture can exercise the exported lease with a fake
+  // bootstrap instead of invoking npm or touching the installed dependency.
+  const fixtureSource = source.replace(/\/\/ Auto-run on import[\s\S]*$/, "");
+  if (fixtureSource === source) throw new Error("ensure-deps auto-run anchor missing");
+  const fixturePath = join(fixtureDir, "ensure-deps-lease-fixture.mjs");
+  writeFileSync(fixturePath, fixtureSource, "utf8");
+  return pathToFileURL(fixturePath).href;
+}
+
+function runLeaseContender(moduleUrl: string, pluginRoot: string, markerPath: string, gatePath: string): Promise<string> {
+  const script = `
+import { appendFileSync, existsSync } from "node:fs";
+const [moduleUrl, pluginRoot, markerPath, gatePath] = process.argv.slice(1);
+const { withNativeBootstrapLease } = await import(moduleUrl);
+while (!existsSync(gatePath)) await new Promise((resolve) => setTimeout(resolve, 5));
+const acquired = await withNativeBootstrapLease(pluginRoot, async () => {
+  appendFileSync(markerPath, process.pid + "\\n");
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+});
+process.stdout.write(acquired ? "owner" : "busy");
+`;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", script, moduleUrl, pluginRoot, markerPath, gatePath], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => { stdout += chunk; });
+    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(`lease contender exited ${code}: ${stderr}`));
+    });
+  });
+}
+
+describe("ensure-deps: cross-process native bootstrap lease", () => {
+  test("permits one cold bootstrap and leaves concurrent hooks fail-open", async () => {
+    const moduleUrl = createLeaseTestModule();
+    const pluginRoot = createTempRoot();
+    const markerPath = join(pluginRoot, "bootstrap-owners.txt");
+    const gatePath = join(pluginRoot, "start");
+    const contenders = Array.from({ length: 6 }, () =>
+      runLeaseContender(moduleUrl, pluginRoot, markerPath, gatePath),
+    );
+
+    writeFileSync(gatePath, "go", "utf8");
+    const results = await Promise.all(contenders);
+
+    expect(results.filter((result) => result === "owner")).toHaveLength(1);
+    expect(results.filter((result) => result === "busy")).toHaveLength(5);
+    expect(readFileSync(markerPath, "utf8").trim().split("\n")).toHaveLength(1);
+    expect(existsSync(join(pluginRoot, ".context-mode-native-bootstrap.lock"))).toBe(false);
+  }, 15_000);
+
+  test("does not remove a lock it did not create", async () => {
+    const moduleUrl = createLeaseTestModule();
+    const pluginRoot = createTempRoot();
+    const lockPath = join(pluginRoot, ".context-mode-native-bootstrap.lock");
+    writeFileSync(lockPath, "other-owner", "utf8");
+    const { withNativeBootstrapLease } = await import(moduleUrl);
+    let ran = false;
+
+    await expect(withNativeBootstrapLease(pluginRoot, async () => { ran = true; })).resolves.toBe(false);
+    expect(ran).toBe(false);
+    expect(readFileSync(lockPath, "utf8")).toBe("other-owner");
+  });
+
+  test("releases its own lease when the bootstrap throws", async () => {
+    const moduleUrl = createLeaseTestModule();
+    const pluginRoot = createTempRoot();
+    const { withNativeBootstrapLease } = await import(moduleUrl);
+    const lockPath = join(pluginRoot, ".context-mode-native-bootstrap.lock");
+
+    await expect(withNativeBootstrapLease(pluginRoot, async () => {
+      throw new Error("synthetic bootstrap failure");
+    })).rejects.toThrow("synthetic bootstrap failure");
+    expect(existsSync(lockPath)).toBe(false);
   });
 });
